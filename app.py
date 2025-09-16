@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import CharacterTextSplitter
 import os
 
-model_local = ChatOllama(model="gemma3")
+model_local = ChatOllama(model="mistral")
 
 pdf_folder = "pdfs"
 pdf_files = [
@@ -31,14 +31,21 @@ vectorstore = Chroma.from_documents(
 )
 retriever = vectorstore.as_retriever()
 
-after_rag_template = """Answer the question based only on the following context, Please anwers as clear as possible, answer response in bahasa indonesia
-, answer question without specifying the source of the answer.:
+after_rag_template = """Jawab pertanyaan berikut secara langsung, singkat, dan jelas dalam bahasa Indonesia, hanya berdasarkan konteks yang diberikan. Jangan sebutkan sumber atau dokumen.
+
+Riwayat chat:
+{chat_history}
+Konteks:
 {context}
-Question: {question}
+Pertanyaan: {question}
 """
 after_rag_prompt = ChatPromptTemplate.from_template(after_rag_template)
 after_rag_chain = (
-    {"context": retriever, "question": RunnablePassthrough()}
+    {
+        "context": lambda x: retriever.invoke(x["question"]),
+        "question": lambda x: x["question"],
+        "chat_history": lambda x: x["chat_history"]
+    }
     | after_rag_prompt
     | model_local
     | StrOutputParser()
@@ -46,15 +53,52 @@ after_rag_chain = (
 
 app = FastAPI()
 
+# In-memory chat history store (for demo)
+chat_histories = {}
+
+def format_chat_history(history):
+    # Format as string for prompt
+    return "\n".join([f"User: {q}\nBot: {a}" for q, a in history])
+
 @app.post("/ask")
 async def ask_question(request: Request):
-    data = await request.json()
-    question = data.get("question", "")
-    if not question:
-        return JSONResponse({"error": "No question provided"}, status_code=400)
-    answer = after_rag_chain.invoke(question)
-    return {"answer": answer}
+    try:
+        data = await request.json()
+        question = data.get("question", "")
+        session_id = data.get("session_id", "default")
+
+        if not question:
+            return JSONResponse({"error": "No question provided"}, status_code=400)
+
+        history = chat_histories.get(session_id, [])
+        chat_history_str = format_chat_history(history)
+
+        answer = after_rag_chain.invoke({"question": question, "chat_history": chat_history_str})
+
+        history.append((question, answer))
+        chat_histories[session_id] = history
+
+        return {"answer": answer, "chat_history": history}
+    except Exception as e:
+        print("Error in /ask:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/test")
 async def test_connection():
     return {"status": "ok", "message": "Connection successful"}
+
+@app.post("/history")
+async def get_history(request: Request):
+    try:
+        data = await request.json()
+        session_id = data.get("session_id", "default")
+        history = chat_histories.get(session_id, [])
+        # Format with index
+        formatted_history = [
+            {"index": i + 1, "question": q, "answer": a}
+            for i, (q, a) in enumerate(history)
+        ]
+        return {"chat_history": formatted_history}
+    except Exception as e:
+        print("Error in /history:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
