@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
 from langchain_ollama.embeddings import OllamaEmbeddings
@@ -9,6 +10,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import CharacterTextSplitter
 import os
+
 
 model_local = ChatOllama(model="mistral")
 
@@ -52,6 +54,14 @@ after_rag_chain = (
 )
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Ganti "*" dengan domain Laravel jika perlu
+    allow_credentials=True,
+    allow_methods=["*"],  # Izinkan semua metode HTTP
+    allow_headers=["*"],  # Izinkan semua header
+)
 
 # In-memory chat history store (for demo)
 chat_histories = {}
