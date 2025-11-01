@@ -10,9 +10,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import CharacterTextSplitter
 import os
+import json
 
 
-model_local = ChatOllama(model="mistral")
+model_local = ChatOllama(model="deepseek-r1")
 
 pdf_folder = "pdfs"
 pdf_files = [
@@ -33,13 +34,42 @@ vectorstore = Chroma.from_documents(
 )
 retriever = vectorstore.as_retriever()
 
-after_rag_template = """Jawab pertanyaan berikut secara langsung, singkat, dan jelas dalam bahasa Indonesia, hanya berdasarkan konteks yang diberikan. Jangan sebutkan sumber atau dokumen.
+after_rag_template = """Anda adalah asisten profesional. Gunakan bahasa Indonesia formal namun bersahabat. Jawab hanya berdasarkan KONTEKS yang diberikan — jangan berspekulasi atau menambahkan informasi di luar konteks. Jangan menyebutkan nama dokumen atau sumber.
+
+Instruksi output (WAJIB): Keluarkan satu objek JSON tunggal saja (tanpa teks tambahan). Format harus persis:
+{{
+  "summary": "<ringkasan 1-2 kalimat atau pesan-not-found>",
+  "details": ["<poin pendukung 1>", "<poin pendukung 2>", ...],
+  "evidence": ["<cuplikan konteks 1 (maks 200 karakter)>", ...],
+  "conflicts": ["<perbedaan 1>", ...],
+  "recommendation": "<rekomendasi singkat atau empty string>"
+}}
+
+Jika konteks tidak memadai, keluarkan persis:
+{{
+  "summary": "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut.",
+  "details": [],
+  "evidence": [],
+  "conflicts": [],
+  "recommendation": ""
+}}
+
+Aturan:
+- Jawab hanya dari KONTEKS. Tidak ada spekulasi.
+- Jangan menyebutkan nama dokumen atau sumber.
+- "details", "evidence", dan "conflicts" harus array string.
+- Evidence adalah potongan teks singkat (maks 200 karakter) yang mendukung poin; tidak menyertakan metadata file.
+- Maksimal total item dalam details+conflicts+evidence: 6–8 elemen gabungan.
+- Summary maksimal 1–2 kalimat.
 
 Riwayat chat:
 {chat_history}
+
 Konteks:
 {context}
-Pertanyaan: {question}
+
+Pertanyaan:
+{question}
 """
 after_rag_prompt = ChatPromptTemplate.from_template(after_rag_template)
 after_rag_chain = (
@@ -67,8 +97,15 @@ app.add_middleware(
 chat_histories = {}
 
 def format_chat_history(history):
-    # Format as string for prompt
-    return "\n".join([f"User: {q}\nBot: {a}" for q, a in history])
+    # Format as string for prompt; gunakan ringkasan tiap jawaban jika tersedia
+    lines = []
+    for q, a in history:
+        if isinstance(a, dict):
+            summary = a.get("summary", "")
+        else:
+            summary = str(a)
+        lines.append(f"User: {q}\nBot: {summary}")
+    return "\n".join(lines)
 
 @app.post("/ask")
 async def ask_question(request: Request):
@@ -83,12 +120,56 @@ async def ask_question(request: Request):
         history = chat_histories.get(session_id, [])
         chat_history_str = format_chat_history(history)
 
-        answer = after_rag_chain.invoke({"question": question, "chat_history": chat_history_str})
+        # invoke chain (model diinstruksikan mengeluarkan JSON)
+        answer_raw = after_rag_chain.invoke({"question": question, "chat_history": chat_history_str})
 
-        history.append((question, answer))
+        # Parse JSON output; jika gagal, fallback ke struktur aman
+        parsed_answer = None
+        if isinstance(answer_raw, dict):
+            parsed_answer = answer_raw
+        else:
+            # try direct json
+            try:
+                parsed_answer = json.loads(answer_raw)
+            except Exception:
+                # try to recover JSON substring
+                try:
+                    start = answer_raw.find("{")
+                    end = answer_raw.rfind("}") + 1
+                    if start != -1 and end != -1:
+                        parsed_answer = json.loads(answer_raw[start:end])
+                except Exception:
+                    parsed_answer = None
+
+        if not isinstance(parsed_answer, dict):
+            # fallback: wrap raw text into summary
+            parsed_answer = {
+                "summary": answer_raw if isinstance(answer_raw, str) else str(answer_raw),
+                "details": [],
+                "evidence": [],
+                "conflicts": [],
+                "recommendation": ""
+            }
+
+        # Ensure required fields exist and types are correct
+        parsed_answer.setdefault("summary", "")
+        parsed_answer.setdefault("details", [])
+        parsed_answer.setdefault("evidence", [])
+        parsed_answer.setdefault("conflicts", [])
+        parsed_answer.setdefault("recommendation", "")
+
+        # store structured answer in history (so next prompts get summaries)
+        history.append((question, parsed_answer))
         chat_histories[session_id] = history
 
-        return {"answer": answer, "chat_history": history}
+        # return structured response for frontend
+        return {
+            "answer": parsed_answer,
+            "chat_history": [
+                {"index": i + 1, "question": q, "answer": a}
+                for i, (q, a) in enumerate(history)
+            ],
+        }
     except Exception as e:
         print("Error in /ask:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
