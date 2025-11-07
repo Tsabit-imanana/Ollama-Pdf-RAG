@@ -34,34 +34,29 @@ vectorstore = Chroma.from_documents(
 )
 retriever = vectorstore.as_retriever()
 
+# Updated prompt: model MUST output a single JSON object {"answer":"<jawaban text>"} only.
 after_rag_template = """Anda adalah asisten profesional. Gunakan bahasa Indonesia formal namun bersahabat. Jawab hanya berdasarkan KONTEKS yang diberikan — jangan berspekulasi atau menambahkan informasi di luar konteks. Jangan menyebutkan nama dokumen atau sumber.
 
 Instruksi output (WAJIB): Keluarkan satu objek JSON tunggal saja (tanpa teks tambahan). Format harus persis:
-{{
-  "summary": "<ringkasan 1-2 kalimat atau pesan-not-found>",
-  "details": ["<poin pendukung 1>", "<poin pendukung 2>", ...],
-  "evidence": ["<cuplikan konteks 1 (maks 200 karakter)>", ...],
-  "conflicts": ["<perbedaan 1>", ...],
-  "recommendation": "<rekomendasi singkat atau empty string>"
+{{ 
+  "answer": "<jawaban singkat berbentuk teks>"
 }}
 
 Jika konteks tidak memadai, keluarkan persis:
-{{
-  "summary": "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut.",
-  "details": [],
-  "evidence": [],
-  "conflicts": [],
-  "recommendation": ""
+{{ 
+  "answer": "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut."
 }}
 
 Aturan:
 - Jawab hanya dari KONTEKS. Tidak ada spekulasi.
-- Jangan menyebutkan nama dokumen atau sumber.
-- "details", "evidence", dan "conflicts" harus array string.
-- Evidence adalah potongan teks singkat (maks 200 karakter) yang mendukung poin; tidak menyertakan metadata file.
-- Maksimal total item dalam details+conflicts+evidence: 6–8 elemen gabungan.
-- Summary maksimal 1–2 kalimat.
-
+- Jawaban adalah teks bebas jelaskan sedetail mungkin dalam Bahasa Indonesia formal.
+- Buat jawaban seperti anda sendang melakukan tutorial step by step
+- tutorial step by step harus diurutkan dengan nomor
+- Jika ada daftar, gunakan bullet points.
+- Jika konteks tidak memadai, keluarkan jawaban default di atas.
+- Jangan keluarkan field selain 'answer'.
+- Riwayat chat (ringkasan jawaban sebelumnya) akan disisipkan di bawah.
+  
 Riwayat chat:
 {chat_history}
 
@@ -74,6 +69,8 @@ Pertanyaan:
 after_rag_prompt = ChatPromptTemplate.from_template(after_rag_template)
 after_rag_chain = (
     {
+
+
         "context": lambda x: retriever.invoke(x["question"]),
         "question": lambda x: x["question"],
         "chat_history": lambda x: x["chat_history"]
@@ -87,7 +84,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Ganti "*" dengan domain Laravel jika perlu
+    allow_origins=["*"],  # tetap "*"
     allow_credentials=True,
     allow_methods=["*"],  # Izinkan semua metode HTTP
     allow_headers=["*"],  # Izinkan semua header
@@ -97,14 +94,10 @@ app.add_middleware(
 chat_histories = {}
 
 def format_chat_history(history):
-    # Format as string for prompt; gunakan ringkasan tiap jawaban jika tersedia
+    # Format as string for prompt; gunakan jawaban singkat tiap entry
     lines = []
     for q, a in history:
-        if isinstance(a, dict):
-            summary = a.get("summary", "")
-        else:
-            summary = str(a)
-        lines.append(f"User: {q}\nBot: {summary}")
+        lines.append(f"User: {q}\nBot: {a}")
     return "\n".join(lines)
 
 @app.post("/ask")
@@ -115,68 +108,69 @@ async def ask_question(request: Request):
         session_id = data.get("session_id", "default")
 
         if not question:
-            return JSONResponse({"error": "No question provided"}, status_code=400)
+            default_msg = "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut."
+            return JSONResponse({"answer": default_msg, "chat_history": []}, status_code=400)
 
         history = chat_histories.get(session_id, [])
         chat_history_str = format_chat_history(history)
 
-        # invoke chain (model diinstruksikan mengeluarkan JSON)
+        # invoke chain (model diinstruksikan mengeluarkan JSON {"answer":"..."})
         answer_raw = after_rag_chain.invoke({"question": question, "chat_history": chat_history_str})
 
-        # Parse JSON output; jika gagal, fallback ke struktur aman
-        parsed_answer = None
+        # Parse JSON output to extract "answer" string; robust fallback to default message
+        extracted_answer = None
         if isinstance(answer_raw, dict):
-            parsed_answer = answer_raw
+            extracted_answer = answer_raw.get("answer", None)
         else:
-            # try direct json
+            # try direct json parse
             try:
-                parsed_answer = json.loads(answer_raw)
+                parsed = json.loads(answer_raw)
+                if isinstance(parsed, dict) and "answer" in parsed:
+                    extracted_answer = parsed.get("answer")
             except Exception:
                 # try to recover JSON substring
                 try:
                     start = answer_raw.find("{")
                     end = answer_raw.rfind("}") + 1
                     if start != -1 and end != -1:
-                        parsed_answer = json.loads(answer_raw[start:end])
+                        parsed = json.loads(answer_raw[start:end])
+                        if isinstance(parsed, dict) and "answer" in parsed:
+                            extracted_answer = parsed.get("answer")
                 except Exception:
-                    parsed_answer = None
+                    extracted_answer = None
 
-        if not isinstance(parsed_answer, dict):
-            # fallback: wrap raw text into summary
-            parsed_answer = {
-                "summary": answer_raw if isinstance(answer_raw, str) else str(answer_raw),
-                "details": [],
-                "evidence": [],
-                "conflicts": [],
-                "recommendation": ""
-            }
+        # Fallbacks
+        if not extracted_answer or not isinstance(extracted_answer, str):
+            # If model returned something but not parsable, use raw string if available
+            if isinstance(answer_raw, str) and answer_raw.strip():
+                extracted_answer = answer_raw.strip()
+            else:
+                extracted_answer = "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut."
 
-        # Ensure required fields exist and types are correct
-        parsed_answer.setdefault("summary", "")
-        parsed_answer.setdefault("details", [])
-        parsed_answer.setdefault("evidence", [])
-        parsed_answer.setdefault("conflicts", [])
-        parsed_answer.setdefault("recommendation", "")
-
-        # store structured answer in history (so next prompts get summaries)
-        history.append((question, parsed_answer))
+        # store answer string in history
+        history.append((question, extracted_answer))
         chat_histories[session_id] = history
 
-        # return structured response for frontend
-        return {
-            "answer": parsed_answer,
-            "chat_history": [
-                {"index": i + 1, "question": q, "answer": a}
-                for i, (q, a) in enumerate(history)
-            ],
-        }
+        formatted_history = [
+            {"index": i + 1, "question": q, "answer": a}
+            for i, (q, a) in enumerate(history)
+        ]
+
+        # Return only answer (string) and chat_history
+        return {"answer": extracted_answer, "chat_history": formatted_history}
     except Exception as e:
         print("Error in /ask:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        default_msg = "Maaf, saya tidak menemukan informasi terkait dalam dokumen. Silakan hubungi CS Trustmedis untuk bantuan lebih lanjut."
+        current_history = chat_histories.get(data.get("session_id", "default")) if 'data' in locals() else []
+        formatted_history = [
+            {"index": i + 1, "question": q, "answer": a}
+            for i, (q, a) in enumerate(current_history)
+        ]
+        return JSONResponse({"answer": default_msg, "chat_history": formatted_history}, status_code=500)
 
 @app.get("/test")
 async def test_connection():
-    return {"status": "ok", "message": "Connection successful"}
+    return {"answer": "ok", "chat_history": []}
 
 @app.post("/history")
 async def get_history(request: Request):
@@ -184,7 +178,7 @@ async def get_history(request: Request):
         data = await request.json()
         session_id = data.get("session_id", "default")
         history = chat_histories.get(session_id, [])
-        # Format with index
+        # Format with index; answer is string
         formatted_history = [
             {"index": i + 1, "question": q, "answer": a}
             for i, (q, a) in enumerate(history)
